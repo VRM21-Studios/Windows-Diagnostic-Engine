@@ -5,716 +5,888 @@
 #           and disk latency, and CPU/GPU/storage thermal conditions.
 # ======================================================================
 
-Write-Host "=== LATENCY & THERMAL DETAILED DIAGNOSTIC ===" -ForegroundColor Cyan
+$ErrorActionPreference = "SilentlyContinue"
+
+# ======================================================================
+# Initialization
+# ======================================================================
 
 $LatencyScore = 100
 $ThermalScore = 100
-$LatencyIssues = @()
-$LatencyWarnings = @()
-$ThermalIssues = @()
-$ThermalWarnings = @()
+
+$Issues = @()
+$Warnings = @()
+$HighLatencyDrivers = @()
 
 # ======================================================================
-# 1. CPU / System Latency Overview
+# Administrator Status
 # ======================================================================
-Write-Host "`n[1] SYSTEM LATENCY OVERVIEW" -ForegroundColor Yellow
 
-try {
-    $CpuIntr = (
-        Get-Counter "\Processor(_Total)\% Interrupt Time" -SampleInterval 1 -MaxSamples 3 |
-        Select-Object -ExpandProperty CounterSamples |
-        Select-Object -Last 1
-    ).CookedValue
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
 
-    $CpuDpc = (
-        Get-Counter "\Processor(_Total)\% DPC Time" -SampleInterval 1 -MaxSamples 3 |
-        Select-Object -ExpandProperty CounterSamples |
-        Select-Object -Last 1
-    ).CookedValue
-
-    $CtxSwitch = (
-        Get-Counter "\System\Context Switches/sec" -SampleInterval 1 -MaxSamples 3 |
-        Select-Object -ExpandProperty CounterSamples |
-        Select-Object -Last 1
-    ).CookedValue
-
-    Write-Host "Current Interrupt Time : $([math]::Round($CpuIntr, 2)) %" -ForegroundColor $(
-        if ($CpuIntr -lt 1) {
-            "Green"
-        }
-        elseif ($CpuIntr -lt 5) {
-            "Yellow"
-        }
-        else {
-            "Red"
-        }
-    )
-
-    Write-Host "Current DPC Time       : $([math]::Round($CpuDpc, 2)) %" -ForegroundColor $(
-        if ($CpuDpc -lt 1) {
-            "Green"
-        }
-        elseif ($CpuDpc -lt 5) {
-            "Yellow"
-        }
-        else {
-            "Red"
-        }
-    )
-
-    Write-Host "Context Switches/sec   : $([math]::Round($CtxSwitch, 0))"
-
-    if ($CpuIntr -ge 5 -or $CpuDpc -ge 5) {
-        $LatencyScore -= 25
-        $LatencyIssues += "High DPC/Interrupt percentage"
-    }
-    elseif ($CpuIntr -ge 1 -or $CpuDpc -ge 1) {
-        $LatencyScore -= 10
-        $LatencyWarnings += "Moderate DPC/Interrupt activity (watch under gaming load)"
-    }
-
-    if ($CtxSwitch -gt 50000) {
-        $LatencyWarnings += "High context switching rate; may indicate driver activity or heavy multitasking"
-        $LatencyScore -= 10
-    }
-}
-catch {
-    Write-Host "System latency counters unavailable: $($_.Exception.Message)" -ForegroundColor Red
-    $LatencyScore -= 20
-    $LatencyWarnings += "Cannot read core latency counters"
-}
-
-# ======================================================================
-# 2. DPC / ISR Per-Driver (Best Effort)
-# ======================================================================
-Write-Host "`n[2] DPC / ISR PER-DRIVER (BEST-EFFORT)" -ForegroundColor Yellow
-
-$DriverGroups = $null
-
-try {
-    # These counters are not available on every Windows system.
-    $drvCounters = Get-Counter `
-        '\Interrupts(*)\DPCs Queued/sec',
-        '\Interrupts(*)\ISRs/sec' `
-        -ErrorAction Stop
-
-    $DriverGroups = @{}
-
-    foreach ($sample in $drvCounters.CounterSamples) {
-        $inst = $sample.InstanceName
-
-        if ($inst -eq "_Total") {
-            continue
-        }
-
-        if (-not $DriverGroups.ContainsKey($inst)) {
-            $DriverGroups[$inst] = [ordered]@{
-                DPC = 0
-                ISR = 0
-            }
-        }
-
-        if ($sample.Path -like '*DPCs Queued*') {
-            $DriverGroups[$inst].DPC = $sample.CookedValue
-        }
-        else {
-            $DriverGroups[$inst].ISR = $sample.CookedValue
-        }
-    }
-
-    if ($DriverGroups.Count -gt 0) {
-        Write-Host "Top DPC/ISR sources:" -ForegroundColor White
-
-        $DriverGroups.GetEnumerator() |
-            Sort-Object { $_.Value.DPC + $_.Value.ISR } -Descending |
-            Select-Object -First 10 `
-                @{N="Driver"; E={$_.Key}},
-                @{N="DPC/sec"; E={[math]::Round($_.Value.DPC, 2)}},
-                @{N="ISR/sec"; E={[math]::Round($_.Value.ISR, 2)}} |
-            Format-Table -AutoSize
-    }
-    else {
-        Write-Host "No per-driver DPC data found." -ForegroundColor Gray
-    }
-}
-catch {
-    Write-Host "Per-driver DPC/ISR counters not available on this system." -ForegroundColor Gray
-}
-
-# ======================================================================
-# 3. Common High-Latency Driver Name Scan
-# ======================================================================
-Write-Host "`n[3] COMMON HIGH-LATENCY DRIVER PATTERN SCAN" -ForegroundColor Yellow
-
-$CulpritPatterns = @(
-    "ndis",     # Network stack
-    "rtwlane",  # Realtek Wi-Fi
-    "rtw",      # Realtek Wi-Fi variants
-    "acpi",     # ACPI / BIOS
-    "hda",      # Audio
-    "rtk",      # Realtek audio
-    "usb",      # USB host controllers
-    "asmt",     # ASMedia USB/SATA
-    "nvlddmkm", # NVIDIA GPU driver
-    "amdpp",    # AMD power management
-    "amdgpio"   # AMD GPIO
+$IsAdministrator = $CurrentPrincipal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 
-$FoundCulprits = @()
+Write-Host ""
+Write-Host "Administrator Status : " -NoNewline
 
-if ($DriverGroups -and $DriverGroups.Count -gt 0) {
-    foreach ($pattern in $CulpritPatterns) {
-        $hits = $DriverGroups.Keys |
-            Where-Object { $_ -match $pattern }
-
-        if ($hits) {
-            $FoundCulprits += $hits
-        }
-    }
-}
-
-if ($FoundCulprits.Count -gt 0) {
-    Write-Host "Potential high-latency driver instances detected:" -ForegroundColor Yellow
-
-    $FoundCulprits |
-        Sort-Object -Unique |
-        Format-Table
-
-    $LatencyWarnings += "Some known high-latency driver families are active; monitor under load"
+if ($IsAdministrator) {
+    Write-Host "YES" -ForegroundColor Green
 }
 else {
-    Write-Host "No common high-latency driver patterns detected (from available counters)." -ForegroundColor Green
+    Write-Host "NO" -ForegroundColor Yellow
+    Write-Host "WARNING: Some diagnostic counters and hardware sensors may be unavailable without elevation." -ForegroundColor Yellow
 }
 
 # ======================================================================
-# 4. Network and Disk Latency Snapshot
+# Temperature Conversion
 # ======================================================================
-Write-Host "`n[4] NETWORK & DISK LATENCY SNAPSHOT" -ForegroundColor Yellow
 
-# ----------------------------------------------------------------------
-# Disk Average Latency
-# ----------------------------------------------------------------------
-try {
-    $DiskLatency = (
-        Get-Counter '\PhysicalDisk(_Total)\Avg. Disk sec/Transfer' `
-            -SampleInterval 1 `
-            -MaxSamples 3 |
-        Select-Object -ExpandProperty CounterSamples |
-        Select-Object -Last 1
+function Convert-Temperature {
+    param (
+        [Parameter(Mandatory = $true)]
+        [double]$Celsius
     )
 
-    $AvgDiskSec = $DiskLatency.CookedValue
-    $AvgDiskMs = [math]::Round($AvgDiskSec * 1000, 2)
-
-    Write-Host "Avg Disk Latency: $AvgDiskMs ms/transfer" -ForegroundColor $(
-        if ($AvgDiskMs -lt 15) {
-            "Green"
-        }
-        elseif ($AvgDiskMs -lt 30) {
-            "Yellow"
-        }
-        else {
-            "Red"
-        }
-    )
-
-    if ($AvgDiskMs -gt 30) {
-        $LatencyWarnings += "Disk latency higher than normal; check storage load or health"
-        $LatencyScore -= 10
+    return [ordered]@{
+        Celsius    = [math]::Round($Celsius, 2)
+        Fahrenheit = [math]::Round(($Celsius * 9 / 5) + 32, 2)
+        Kelvin     = [math]::Round($Celsius + 273.15, 2)
+        Reaumur    = [math]::Round($Celsius * 0.8, 2)
+        Rankine    = [math]::Round(($Celsius + 273.15) * 9 / 5, 2)
+        Delisle    = [math]::Round((100 - $Celsius) * 1.5, 2)
+        Newton     = [math]::Round($Celsius * 0.33, 2)
+        Romer      = [math]::Round(($Celsius * 21 / 40) + 7.5, 2)
     }
 }
-catch {
-    Write-Host "Disk latency counters not available." -ForegroundColor Gray
+
+function Write-TemperatureReport {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+
+        [Parameter(Mandatory = $true)]
+        [double]$Celsius
+    )
+
+    $Temperature = Convert-Temperature -Celsius $Celsius
+
+    Write-Host "$Label"
+    Write-Host ("  Celsius    : {0:N2} °C" -f $Temperature.Celsius)
+    Write-Host ("  Fahrenheit : {0:N2} °F" -f $Temperature.Fahrenheit)
+    Write-Host ("  Kelvin     : {0:N2} K"  -f $Temperature.Kelvin)
+    Write-Host ("  Réaumur    : {0:N2} °Ré" -f $Temperature.Reaumur)
+    Write-Host ("  Rankine    : {0:N2} °Ra" -f $Temperature.Rankine)
+    Write-Host ("  Delisle    : {0:N2} °De" -f $Temperature.Delisle)
+    Write-Host ("  Newton     : {0:N2} °N" -f $Temperature.Newton)
+    Write-Host ("  Rømer      : {0:N2} °Rø" -f $Temperature.Romer)
+
+    return $Temperature
 }
 
-# ----------------------------------------------------------------------
-# Simple Network Latency Probe (Best Effort)
-# ----------------------------------------------------------------------
+# ======================================================================
+# CPU and System Latency Counters
+# ======================================================================
+
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "CPU and System Latency"
+Write-Host "======================================================================"
+
+$InterruptPercent = $null
+$DpcPercent = $null
+$ContextSwitches = $null
+
 try {
-    Write-Host "`nNetwork latency test (ICMP ping to 1.1.1.1)..." -ForegroundColor White
+    $InterruptPercent = (
+        Get-Counter "\Processor(_Total)\% Interrupt Time"
+    ).CounterSamples[0].CookedValue
 
-    $Ping = Test-NetConnection `
-        -ComputerName 1.1.1.1 `
-        -InformationLevel Quiet `
-        -ErrorAction SilentlyContinue
+    $DpcPercent = (
+        Get-Counter "\Processor(_Total)\% DPC Time"
+    ).CounterSamples[0].CookedValue
 
-    if ($Ping) {
-        $PingDetail = Test-NetConnection `
-            -ComputerName 1.1.1.1 `
-            -InformationLevel Detailed
+    $ContextSwitches = (
+        Get-Counter "\System\Context Switches/sec"
+    ).CounterSamples[0].CookedValue
 
-        $LatencyMs = $PingDetail.PingReplyDetails.RoundtripTime
+    Write-Host ("Current Interrupt Time : {0:N2} %" -f $InterruptPercent)
+    Write-Host ("Current DPC Time       : {0:N2} %" -f $DpcPercent)
+    Write-Host ("Context Switches/sec   : {0:N0}" -f $ContextSwitches)
+}
+catch {
+    Write-Host "Performance counters are unavailable." -ForegroundColor Yellow
+    $Warnings += "System performance counters are unavailable."
+}
 
-        Write-Host "Ping Latency: $LatencyMs ms" -ForegroundColor $(
-            if ($LatencyMs -lt 40) {
-                "Green"
-            }
-            elseif ($LatencyMs -lt 80) {
-                "Yellow"
-            }
-            else {
-                "Red"
-            }
-        )
+# ======================================================================
+# Driver DPC and ISR Activity
+# ======================================================================
+
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "Driver DPC / ISR Activity"
+Write-Host "======================================================================"
+
+try {
+    $DpcSamples = Get-Counter "\Interrupts(*)\DPCs Queued/sec"
+    $IsrSamples = Get-Counter "\Interrupts(*)\ISRs/sec"
+
+    $DriverActivity = @()
+
+    foreach ($sample in $DpcSamples.CounterSamples) {
+
+        $instance = $sample.InstanceName
+        $dpcValue = $sample.CookedValue
+
+        $matchingIsr = $IsrSamples.CounterSamples |
+            Where-Object {
+                $_.InstanceName -eq $instance
+            } |
+            Select-Object -First 1
+
+        $isrValue = 0
+
+        if ($matchingIsr) {
+            $isrValue = $matchingIsr.CookedValue
+        }
+
+        $DriverActivity += [PSCustomObject]@{
+            Driver = $instance
+            DPC    = $dpcValue
+            ISR    = $isrValue
+        }
+    }
+
+    if ($DriverActivity.Count -eq 0) {
+        Write-Host "No per-driver DPC/ISR activity was returned."
     }
     else {
-        Write-Host "Network latency test failed (no connectivity or ICMP blocked)." -ForegroundColor Gray
+
+        foreach ($driver in $DriverActivity) {
+
+            if (($driver.DPC -ge 1000) -or ($driver.ISR -ge 1000)) {
+
+                $HighLatencyDrivers += [PSCustomObject]@{
+                    Driver = $driver.Driver
+                    DPC    = [math]::Round($driver.DPC, 2)
+                    ISR    = [math]::Round($driver.ISR, 2)
+                }
+            }
+        }
+
+        if ($HighLatencyDrivers.Count -eq 0) {
+            Write-Host "No common high-latency driver patterns detected."
+        }
+        else {
+
+            Write-Host "Potential high-latency driver activity detected:" -ForegroundColor Yellow
+
+            foreach ($driver in $HighLatencyDrivers) {
+                Write-Host (
+                    "  {0} | DPC: {1:N2}/sec | ISR: {2:N2}/sec" -f
+                    $driver.Driver,
+                    $driver.DPC,
+                    $driver.ISR
+                )
+            }
+
+            $LatencyScore -= 15
+            $Warnings += "Potentially elevated driver DPC/ISR activity detected."
+        }
     }
 }
 catch {
-    Write-Host "Network latency test unavailable." -ForegroundColor Gray
+    Write-Host "Per-driver DPC/ISR counters are unavailable."
+    $Warnings += "Per-driver DPC/ISR counters are unavailable on this system."
 }
 
 # ======================================================================
-# 5. CPU / System Thermal Status
+# Disk Latency
 # ======================================================================
-Write-Host "`n[5] CPU & SYSTEM THERMAL STATUS" -ForegroundColor Yellow
 
-$CpuTempC = $null
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "Disk Latency"
+Write-Host "======================================================================"
+
+$AvgDiskLatencyMs = $null
 
 try {
-    $TempZones = Get-CimInstance `
-        -Namespace root\WMI `
-        -ClassName MSAcpi_ThermalZoneTemperature `
+
+    $DiskLatencyCounter = Get-Counter `
+        "\PhysicalDisk(_Total)\Avg. Disk sec/Transfer"
+
+    if ($DiskLatencyCounter.CounterSamples.Count -gt 0) {
+
+        $AvgDiskLatencyMs =
+            $DiskLatencyCounter.CounterSamples[0].CookedValue * 1000
+
+        Write-Host (
+            "Average Disk Latency : {0:N2} ms/transfer" -f
+            $AvgDiskLatencyMs
+        )
+
+        if ($AvgDiskLatencyMs -ge 50) {
+
+            $LatencyScore -= 20
+            $Issues += "Average disk latency is critically high."
+        }
+        elseif ($AvgDiskLatencyMs -ge 20) {
+
+            $LatencyScore -= 10
+            $Warnings += "Average disk latency is elevated."
+        }
+    }
+    else {
+        Write-Host "Disk latency data unavailable."
+    }
+}
+catch {
+    Write-Host "Disk latency counter unavailable."
+    $Warnings += "Disk latency counter is unavailable."
+}
+
+# ======================================================================
+# Network Latency
+# ======================================================================
+
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "Network Latency"
+Write-Host "======================================================================"
+
+$PingLatencyMs = $null
+
+try {
+
+    $PingResult = Test-Connection `
+        -ComputerName "1.1.1.1" `
+        -Count 1 `
         -ErrorAction Stop
 
-    if ($TempZones) {
+    $PingLatencyMs = $PingResult.Latency
+
+    Write-Host (
+        "Ping Latency : {0:N0} ms" -f
+        $PingLatencyMs
+    )
+
+    if ($PingLatencyMs -ge 200) {
+
+        $LatencyScore -= 15
+        $Issues += "Network latency is critically high."
+    }
+    elseif ($PingLatencyMs -ge 100) {
+
+        $LatencyScore -= 8
+        $Warnings += "Network latency is elevated."
+    }
+}
+catch {
+
+    Write-Host "Network latency test failed."
+    $Warnings += "Network latency could not be measured."
+}
+
+# ======================================================================
+# CPU / System Thermal Monitoring
+# ======================================================================
+
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "CPU / System Thermal Monitoring"
+Write-Host "======================================================================"
+
+$CpuTempC = $null
+$CpuTemperature = $null
+
+try {
+
+    $ThermalZones = Get-CimInstance `
+        -Namespace "root\WMI" `
+        -ClassName "MSAcpi_ThermalZoneTemperature"
+
+    $ValidTemperatures = @()
+
+    foreach ($zone in $ThermalZones) {
+
+        if ($null -ne $zone.CurrentTemperature) {
+
+            $Celsius = ($zone.CurrentTemperature / 10) - 273.15
+
+            if (($Celsius -gt -50) -and ($Celsius -lt 150)) {
+                $ValidTemperatures += $Celsius
+            }
+        }
+    }
+
+    if ($ValidTemperatures.Count -gt 0) {
+
         # Average all available thermal zones because zone names can vary.
-        $TempsC = @()
+        $CpuTempC = ($ValidTemperatures | Measure-Object -Average).Average
 
-        foreach ($tz in $TempZones) {
-            if ($tz.CurrentTemperature) {
-                $tC = ($tz.CurrentTemperature / 10) - 273.15
+        Write-TemperatureReport `
+            -Label "CPU / Package Temperature (approx):" `
+            -Celsius $CpuTempC | Out-Null
 
-                if ($tC -gt 0 -and $tC -lt 120) {
-                    $TempsC += $tC
-                }
-            }
+        $CpuTemperature = Convert-Temperature -Celsius $CpuTempC
+
+        # Thermal scoring is based exclusively on Celsius.
+        if ($CpuTempC -ge 90) {
+
+            $ThermalScore -= 40
+            $Issues += "CPU/system temperature is critically high."
         }
+        elseif ($CpuTempC -ge 85) {
 
-        if ($TempsC.Count -gt 0) {
-            $CpuTempC = [math]::Round(
-                ($TempsC | Measure-Object -Average).Average,
-                1
-            )
-
-            Write-Host "CPU / Package Temperature (approx): $CpuTempC °C" -ForegroundColor $(
-                if ($CpuTempC -lt 75) {
-                    "Green"
-                }
-                elseif ($CpuTempC -lt 85) {
-                    "Yellow"
-                }
-                else {
-                    "Red"
-                }
-            )
-
-            if ($CpuTempC -ge 90) {
-                $ThermalIssues += "Severe CPU temperature (>= 90°C)"
-                $ThermalScore -= 30
-            }
-            elseif ($CpuTempC -ge 85) {
-                $ThermalWarnings += "High CPU temperature (85–90°C)"
-                $ThermalScore -= 20
-            }
-            elseif ($CpuTempC -ge 75) {
-                $ThermalWarnings += "Elevated CPU temperature (75–85°C)"
-                $ThermalScore -= 10
-            }
+            $ThermalScore -= 25
+            $Warnings += "CPU/system temperature is high."
         }
-        else {
-            Write-Host "Thermal zone returned invalid temperature data." -ForegroundColor Gray
+        elseif ($CpuTempC -ge 75) {
+
+            $ThermalScore -= 10
+            $Warnings += "CPU/system temperature is elevated."
         }
     }
     else {
-        Write-Host "No ACPI thermal zones found." -ForegroundColor Gray
+
+        Write-Host "CPU thermal data unavailable through WMI."
+        $Warnings += "CPU thermal data is unavailable through WMI."
     }
 }
 catch {
-    Write-Host "CPU thermal data not available (WMI ACPI)." -ForegroundColor Gray
+
+    Write-Host "CPU thermal data unavailable through WMI."
+    $Warnings += "CPU thermal monitoring is unavailable through WMI."
 }
 
-# System uptime, useful for interpreting thermal conditions.
-try {
-    $LastBoot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-    $Uptime = (Get-Date) - $LastBoot
+# ======================================================================
+# System Uptime
+# ======================================================================
 
-    Write-Host "System Uptime: $($Uptime.Days) days, $($Uptime.Hours) hours, $($Uptime.Minutes) minutes"
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "System Uptime"
+Write-Host "======================================================================"
+
+$SystemUptime = $null
+
+try {
+
+    $OS = Get-CimInstance Win32_OperatingSystem
+
+    $LastBootTime = $OS.LastBootUpTime
+    $SystemUptime = (Get-Date) - $LastBootTime
+
+    Write-Host (
+        "System Uptime : {0} days, {1} hours, {2} minutes" -f
+        $SystemUptime.Days,
+        $SystemUptime.Hours,
+        $SystemUptime.Minutes
+    )
 }
 catch {
+
+    Write-Host "System uptime unavailable."
 }
 
 # ======================================================================
-# 6. GPU Thermal Status (Best Effort via WMI)
+# GPU Thermal Monitoring
 # ======================================================================
-Write-Host "`n[6] GPU THERMAL STATUS (BEST-EFFORT)" -ForegroundColor Yellow
 
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "GPU Thermal Monitoring"
+Write-Host "======================================================================"
+
+$GpuTempC = $null
+$GpuTemperature = $null
 $GpuTempFound = $false
 
 try {
-    $TempNamespaces = @(
+
+    $Namespaces = @(
         "root\WMI",
         "root\CIMV2",
         "root\Microsoft\Windows\Storage"
     )
 
-    foreach ($ns in $TempNamespaces) {
+    $TemperatureClasses = @()
+
+    foreach ($namespace in $Namespaces) {
+
         try {
+
             $classes = Get-CimClass `
-                -Namespace $ns `
+                -Namespace $namespace `
                 -ErrorAction SilentlyContinue |
                 Where-Object {
-                    $_.CimClassName -match "temperature|Thermal"
+                    $_.CimClassName -match "temperature|thermal"
                 }
 
-            foreach ($c in $classes) {
-                $inst = Get-CimInstance `
-                    -Namespace $ns `
-                    -ClassName $c.CimClassName `
-                    -ErrorAction SilentlyContinue
-
-                foreach ($t in $inst) {
-                    $nameStr = (
-                        $t.Name,
-                        $t.InstanceName,
-                        $t.Description -join " "
-                    ) -as [string]
-
-                    if ($nameStr -match "GPU|Video|Graphics") {
-                        $raw = (
-                            $t.CurrentTemperature,
-                            $t.Temperature,
-                            $t.Temperature_Celsius |
-                            Where-Object { $_ }
-                        ) | Select-Object -First 1
-
-                        if ($raw) {
-                            $guess = [double]$raw
-
-                            if ($guess -gt 150) {
-                                $guess = ($guess / 10) - 273.15
-                            }
-
-                            $guess = [math]::Round($guess, 1)
-
-                            Write-Host "GPU Temperature (from $($c.CimClassName)) : $guess °C" -ForegroundColor $(
-                                if ($guess -lt 80) {
-                                    "Green"
-                                }
-                                elseif ($guess -lt 88) {
-                                    "Yellow"
-                                }
-                                else {
-                                    "Red"
-                                }
-                            )
-
-                            if ($guess -ge 90) {
-                                $ThermalIssues += "Severe GPU temperature (>= 90°C)"
-                                $ThermalScore -= 25
-                            }
-                            elseif ($guess -ge 85) {
-                                $ThermalWarnings += "High GPU temperature (85–90°C)"
-                                $ThermalScore -= 15
-                            }
-                            elseif ($guess -ge 80) {
-                                $ThermalWarnings += "Elevated GPU temperature (80–85°C)"
-                                $ThermalScore -= 10
-                            }
-
-                            $GpuTempFound = $true
-                            break
-                        }
-                    }
+            foreach ($class in $classes) {
+                $TemperatureClasses += [PSCustomObject]@{
+                    Namespace = $namespace
+                    ClassName = $class.CimClassName
                 }
-
-                if ($GpuTempFound) {
-                    break
-                }
-            }
-
-            if ($GpuTempFound) {
-                break
             }
         }
         catch {
+            # Ignore unavailable namespaces and continue the best-effort scan.
         }
     }
 
-    if (-not $GpuTempFound) {
-        Write-Host "GPU temperature not accessible via generic WMI." -ForegroundColor Gray
-        Write-Host "  Use vendor-specific monitoring tools for precise GPU temperature data." -ForegroundColor White
+    $GpuCandidates = @()
+
+    foreach ($entry in $TemperatureClasses) {
+
+        try {
+
+            $objects = Get-CimInstance `
+                -Namespace $entry.Namespace `
+                -ClassName $entry.ClassName `
+                -ErrorAction SilentlyContinue
+
+            foreach ($obj in $objects) {
+
+                $nameStr = @(
+                    $obj.Name
+                    $obj.InstanceName
+                    $obj.Description
+                ) -join " "
+
+                if ($nameStr -match "GPU|Video|Graphics|Display") {
+
+                    $rawValue = $null
+
+                    foreach ($propertyName in @(
+                        "CurrentTemperature",
+                        "Temperature",
+                        "Temperature_Celsius"
+                    )) {
+
+                        if ($obj.PSObject.Properties.Name -contains $propertyName) {
+
+                            $candidateValue = $obj.$propertyName
+
+                            if ($null -ne $candidateValue) {
+                                $rawValue = $candidateValue
+                                break
+                            }
+                        }
+                    }
+
+                    if ($null -ne $rawValue) {
+
+                        $rawValue = [double]$rawValue
+
+                        # Convert common ACPI-style deci-Kelvin values.
+                        if ($rawValue -gt 2000) {
+                            $candidateCelsius = ($rawValue / 10) - 273.15
+                        }
+                        elseif ($rawValue -gt 273) {
+                            $candidateCelsius = $rawValue - 273.15
+                        }
+                        else {
+                            $candidateCelsius = $rawValue
+                        }
+
+                        if (
+                            ($candidateCelsius -gt -50) -and
+                            ($candidateCelsius -lt 150)
+                        ) {
+                            $GpuCandidates += $candidateCelsius
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            # Continue scanning remaining thermal classes.
+        }
+    }
+
+    if ($GpuCandidates.Count -gt 0) {
+
+        $GpuTempC = ($GpuCandidates | Measure-Object -Average).Average
+        $GpuTempFound = $true
+
+        Write-TemperatureReport `
+            -Label "GPU Temperature (best effort):" `
+            -Celsius $GpuTempC | Out-Null
+
+        $GpuTemperature = Convert-Temperature -Celsius $GpuTempC
+
+        # GPU thermal scoring is based exclusively on Celsius.
+        if ($GpuTempC -ge 90) {
+
+            $ThermalScore -= 30
+            $Issues += "GPU temperature is critically high."
+        }
+        elseif ($GpuTempC -ge 85) {
+
+            $ThermalScore -= 20
+            $Warnings += "GPU temperature is high."
+        }
+        elseif ($GpuTempC -ge 75) {
+
+            $ThermalScore -= 10
+            $Warnings += "GPU temperature is elevated."
+        }
+    }
+    else {
+
+        Write-Host "GPU thermal data unavailable through generic WMI."
+        $Warnings += "GPU thermal data is unavailable through generic WMI."
     }
 }
 catch {
-    Write-Host "GPU thermal query failed." -ForegroundColor Gray
+
+    Write-Host "GPU thermal data unavailable through generic WMI."
+    $Warnings += "GPU thermal monitoring is unavailable through generic WMI."
 }
 
 # ======================================================================
-# 7. Disk Thermal Snapshot
+# Physical Disk Thermal Monitoring
 # ======================================================================
-Write-Host "`n[7] DISK THERMAL SNAPSHOT" -ForegroundColor Yellow
+
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "Storage Thermal Monitoring"
+Write-Host "======================================================================"
+
+$DiskTemperatures = @()
 
 try {
-    $DiskSmart = Get-CimInstance `
-        -Namespace root\Microsoft\Windows\Storage `
-        -ClassName MSFT_PhysicalDisk `
-        -ErrorAction Stop
 
-    foreach ($d in $DiskSmart) {
-        Write-Host "Disk: $($d.FriendlyName)" -ForegroundColor White
+    $PhysicalDisks = Get-CimInstance `
+        -Namespace "root\Microsoft\Windows\Storage" `
+        -ClassName "MSFT_PhysicalDisk" `
+        -ErrorAction SilentlyContinue
 
-        if ($d.Temperature) {
-            $dt = [double]$d.Temperature
+    if ($PhysicalDisks.Count -eq 0) {
 
-            Write-Host "  Temperature: $dt °C" -ForegroundColor $(
-                if ($dt -lt 50) {
-                    "Green"
+        Write-Host "Physical disk information unavailable."
+    }
+    else {
+
+        foreach ($disk in $PhysicalDisks) {
+
+            $DiskTemperatureC = $null
+
+            if (
+                ($disk.PSObject.Properties.Name -contains "Temperature") -and
+                ($null -ne $disk.Temperature)
+            ) {
+
+                $rawTemperature = [double]$disk.Temperature
+
+                if ($rawTemperature -gt 0) {
+
+                    if ($rawTemperature -gt 2000) {
+                        $DiskTemperatureC =
+                            ($rawTemperature / 10) - 273.15
+                    }
+                    elseif ($rawTemperature -gt 273) {
+                        $DiskTemperatureC =
+                            $rawTemperature - 273.15
+                    }
+                    else {
+                        $DiskTemperatureC = $rawTemperature
+                    }
+
+                    if (
+                        ($DiskTemperatureC -le -50) -or
+                        ($DiskTemperatureC -ge 150)
+                    ) {
+                        $DiskTemperatureC = $null
+                    }
                 }
-                elseif ($dt -lt 60) {
-                    "Yellow"
-                }
-                else {
-                    "Red"
-                }
-            )
+            }
 
-            if ($dt -ge 60) {
-                $ThermalWarnings += "Disk $($d.FriendlyName) running hot (>= 60°C)"
-                $ThermalScore -= 10
+            $DiskTemperatureObject = $null
+
+            if ($null -ne $DiskTemperatureC) {
+
+                $DiskTemperatureObject =
+                    Convert-Temperature -Celsius $DiskTemperatureC
+
+                Write-Host ""
+                Write-Host (
+                    "Disk: {0}" -f
+                    $disk.FriendlyName
+                )
+
+                Write-TemperatureReport `
+                    -Label "Temperature:" `
+                    -Celsius $DiskTemperatureC | Out-Null
+
+                if ($DiskTemperatureC -ge 70) {
+
+                    $ThermalScore -= 10
+                    $Warnings += (
+                        "Storage temperature is elevated on {0}." -f
+                        $disk.FriendlyName
+                    )
+                }
+            }
+            else {
+
+                Write-Host ""
+                Write-Host (
+                    "Disk: {0}" -f
+                    $disk.FriendlyName
+                )
+
+                Write-Host "Temperature : N/A"
+            }
+
+            $DiskTemperatures += [PSCustomObject]@{
+                FriendlyName = $disk.FriendlyName
+                DeviceId     = $disk.DeviceId
+                Health       = $disk.HealthStatus
+                Temperature  = $DiskTemperatureObject
             }
         }
-        else {
-            Write-Host "  Temperature: N/A"
-        }
-
-        Write-Host "  Health     : $($d.HealthStatus)"
     }
 }
 catch {
-    Write-Host "Disk SMART / thermal data not available." -ForegroundColor Gray
+
+    Write-Host "Physical disk thermal data unavailable."
+    $Warnings += "Physical disk thermal data is unavailable."
 }
 
 # ======================================================================
-# 8. Real-Time Snapshot Loop (Short Visual Check)
+# Real-Time System Sampling
 # ======================================================================
-Write-Host "`n[8] SHORT REAL-TIME SNAPSHOT (CPU LOAD + INTERRUPTS + CONTEXT SWITCHES)" -ForegroundColor Yellow
-Write-Host "   (5 samples, 1s interval)" -ForegroundColor Gray
+
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "Real-Time System Sampling"
+Write-Host "======================================================================"
+
+$RealtimeSamples = @()
 
 for ($i = 1; $i -le 5; $i++) {
+
     try {
-        $cpuLoad = (
-            Get-Counter "\Processor(_Total)\% Processor Time" `
-                -SampleInterval 1 `
-                -MaxSamples 1
-        ).CounterSamples.CookedValue
 
-        $intrNow = (
-            Get-Counter "\Processor(_Total)\% Interrupt Time" `
-                -SampleInterval 1 `
-                -MaxSamples 1
-        ).CounterSamples.CookedValue
+        $CpuLoad = (
+            Get-Counter "\Processor(_Total)\% Processor Time"
+        ).CounterSamples[0].CookedValue
 
-        $ctxNow = (
-            Get-Counter "\System\Context Switches/sec" `
-                -SampleInterval 1 `
-                -MaxSamples 1
-        ).CounterSamples.CookedValue
+        $InterruptLoad = (
+            Get-Counter "\Processor(_Total)\% Interrupt Time"
+        ).CounterSamples[0].CookedValue
+
+        $ContextRate = (
+            Get-Counter "\System\Context Switches/sec"
+        ).CounterSamples[0].CookedValue
+
+        $Sample = [PSCustomObject]@{
+            Sample             = $i
+            CpuLoadPercent     = [math]::Round($CpuLoad, 2)
+            InterruptPercent   = [math]::Round($InterruptLoad, 2)
+            ContextSwitchesSec = [math]::Round($ContextRate, 2)
+        }
+
+        $RealtimeSamples += $Sample
 
         Write-Host (
-            "Sample {0}: CPU {1,5:N1}% | Intr {2,4:N2}% | Ctx {3,8:N0}/s" -f
+            "Sample {0}: CPU {1:N2}% | Interrupt {2:N2}% | Context Switches {3:N0}/sec" -f
             $i,
-            $cpuLoad,
-            $intrNow,
-            $ctxNow
-        ) -ForegroundColor $(
-            if ($cpuLoad -gt 90 -or $intrNow -gt 5) {
-                "Red"
-            }
-            elseif ($cpuLoad -gt 70) {
-                "Yellow"
-            }
-            else {
-                "Green"
-            }
+            $CpuLoad,
+            $InterruptLoad,
+            $ContextRate
         )
     }
     catch {
-        Write-Host " Real-time counters not available in this environment." -ForegroundColor Gray
-        break
+
+        Write-Host (
+            "Sample {0}: Performance counters unavailable." -f
+            $i
+        )
     }
+
+    Start-Sleep -Seconds 1
 }
 
 # ======================================================================
-# 9. Final Latency and Thermal Assessment
+# Final Score Calculation
 # ======================================================================
-Write-Host "`n" + "=" * 60 -ForegroundColor Cyan
-Write-Host " FINAL LATENCY & THERMAL ASSESSMENT" -ForegroundColor Cyan
-Write-Host "=" * 60 -ForegroundColor Cyan
 
-$LatencyScore = [math]::Max(0, $LatencyScore)
-$ThermalScore = [math]::Max(0, $ThermalScore)
+$LatencyScore = [math]::Max(0, [math]::Min(100, $LatencyScore))
+$ThermalScore = [math]::Max(0, [math]::Min(100, $ThermalScore))
 
 $OverallScore = [math]::Round(
-    ($LatencyScore + $ThermalScore) / 2
+    ($LatencyScore + $ThermalScore) / 2,
+    0
 )
 
-Write-Host "`nLatency Score : $LatencyScore/100" -ForegroundColor $(
-    if ($LatencyScore -ge 80) {
-        "Green"
-    }
-    elseif ($LatencyScore -ge 60) {
-        "Yellow"
-    }
-    else {
-        "Red"
-    }
-)
+# ======================================================================
+# Diagnostic Summary
+# ======================================================================
 
-Write-Host "Thermal Score : $ThermalScore/100" -ForegroundColor $(
-    if ($ThermalScore -ge 80) {
-        "Green"
-    }
-    elseif ($ThermalScore -ge 60) {
-        "Yellow"
-    }
-    else {
-        "Red"
-    }
-)
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "Diagnostic Summary"
+Write-Host "======================================================================"
 
-Write-Host "`nOVERALL LATENCY/THERMAL HEALTH: $OverallScore/100" -ForegroundColor $(
-    if ($OverallScore -ge 80) {
-        "Green"
-    }
-    elseif ($OverallScore -ge 60) {
-        "Yellow"
-    }
-    else {
-        "Red"
-    }
-)
+Write-Host ("Latency Score : {0}/100" -f $LatencyScore)
+Write-Host ("Thermal Score : {0}/100" -f $ThermalScore)
+Write-Host ("Overall Score : {0}/100" -f $OverallScore)
 
-if ($LatencyIssues.Count -gt 0) {
-    Write-Host "`n CRITICAL LATENCY ISSUES:" -ForegroundColor Red
+if ($Issues.Count -gt 0) {
 
-    $LatencyIssues |
-        Sort-Object -Unique |
-        ForEach-Object {
-            Write-Host "   • $_" -ForegroundColor Red
-        }
+    Write-Host ""
+    Write-Host "Critical Issues:" -ForegroundColor Red
+
+    foreach ($issue in $Issues) {
+        Write-Host ("  - {0}" -f $issue)
+    }
 }
 
-if ($LatencyWarnings.Count -gt 0) {
-    Write-Host "`n LATENCY WARNINGS:" -ForegroundColor Yellow
+if ($Warnings.Count -gt 0) {
 
-    $LatencyWarnings |
-        Sort-Object -Unique |
-        ForEach-Object {
-            Write-Host "   • $_" -ForegroundColor Yellow
-        }
+    Write-Host ""
+    Write-Host "Warnings:" -ForegroundColor Yellow
+
+    foreach ($warning in $Warnings) {
+        Write-Host ("  - {0}" -f $warning)
+    }
 }
 
-if ($ThermalIssues.Count -gt 0) {
-    Write-Host "`n CRITICAL THERMAL ISSUES:" -ForegroundColor Red
+if (
+    ($Issues.Count -eq 0) -and
+    ($Warnings.Count -eq 0)
+) {
 
-    $ThermalIssues |
-        Sort-Object -Unique |
-        ForEach-Object {
-            Write-Host "   • $_" -ForegroundColor Red
-        }
+    Write-Host ""
+    Write-Host "No significant diagnostic issues detected."
 }
 
-if ($ThermalWarnings.Count -gt 0) {
-    Write-Host "`n THERMAL WARNINGS:" -ForegroundColor Yellow
+# ======================================================================
+# Recommendations
+# ======================================================================
 
-    $ThermalWarnings |
-        Sort-Object -Unique |
-        ForEach-Object {
-            Write-Host "   • $_" -ForegroundColor Yellow
-        }
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "Recommendations"
+Write-Host "======================================================================"
+
+if ($Issues.Count -gt 0) {
+
+    Write-Host "Review the critical issues reported above before performing further testing."
 }
+elseif ($Warnings.Count -gt 0) {
 
-Write-Host "`n RECOMMENDATIONS:" -ForegroundColor Cyan
-
-if ($OverallScore -ge 80) {
-    Write-Host "   • System latency and thermal conditions are favorable for normal use and gaming." -ForegroundColor White
-    Write-Host "   • Continue monitoring during sustained full-load workloads such as rendering or gaming." -ForegroundColor White
-}
-elseif ($OverallScore -ge 60) {
-    Write-Host "   • Check drivers (network/audio/USB/GPU) if stuttering occurs during gaming." -ForegroundColor White
-    Write-Host "   • Ensure adequate chassis or laptop airflow and avoid overly restrictive fan profiles." -ForegroundColor White
-    Write-Host "   • Monitor CPU/GPU temperatures under heavy load using vendor-specific tools." -ForegroundColor White
+    Write-Host "Review the reported warnings and repeat the audit under representative system load."
 }
 else {
-    Write-Host "   • High latency or excessive temperatures detected; this may contribute to stuttering or thermal throttling." -ForegroundColor White
-    Write-Host "   • Update or roll back suspicious drivers and review unnecessary devices or drivers." -ForegroundColor White
-    Write-Host "   • Clean dust from vents, inspect cooling performance, and verify fan operation." -ForegroundColor White
+
+    Write-Host "System latency and thermal indicators are within the expected diagnostic range."
 }
 
+if (-not $IsAdministrator) {
+
+    Write-Host "Run this audit from an elevated PowerShell session for maximum sensor and counter coverage."
+}
+
+Write-Host "For accurate hardware thermal monitoring, use vendor-specific telemetry or a dedicated hardware monitoring utility when WMI data is unavailable."
+
 # ======================================================================
-# 10. JSON Export for Python / LLM Integration
+# JSON Export
 # ======================================================================
 
-$DiagnosticResult = [ordered]@{
-    "LatencyScore"       = $LatencyScore
-    "ThermalScore"       = $ThermalScore
-    "OverallScore"       = $OverallScore
+$DiagnosticReport = [ordered]@{
 
-    "CpuInterruptPct" = if ($null -ne $CpuIntr) {
-        [math]::Round($CpuIntr, 2)
-    }
-    else {
-        0
-    }
+    Timestamp = (Get-Date).ToString("o")
 
-    "CpuDpcPct" = if ($null -ne $CpuDpc) {
-        [math]::Round($CpuDpc, 2)
-    }
-    else {
-        0
-    }
+    IsAdministrator = $IsAdministrator
 
-    "ContextSwitches" = if ($null -ne $CtxSwitch) {
-        [math]::Round($CtxSwitch, 0)
-    }
-    else {
-        0
-    }
+    LatencyScore = $LatencyScore
+    ThermalScore = $ThermalScore
+    OverallScore = $OverallScore
 
-    "AvgDiskLatencyMs" = if ($null -ne $AvgDiskMs) {
-        $AvgDiskMs
-    }
-    else {
-        0
-    }
-
-    "PingLatencyMs" = if ($null -ne $LatencyMs) {
-        $LatencyMs
-    }
-    else {
-        0
-    }
-
-    "CpuTempC" = if ($null -ne $CpuTempC) {
-        $CpuTempC
+    InterruptPercent = if ($null -ne $InterruptPercent) {
+        [math]::Round($InterruptPercent, 2)
     }
     else {
         $null
     }
 
-    "GpuTempFound"       = $GpuTempFound
-    "HighLatencyDrivers" = $FoundCulprits
-    "LatencyIssues"      = $LatencyIssues
-    "LatencyWarnings"    = $LatencyWarnings
-    "ThermalIssues"      = $ThermalIssues
-    "ThermalWarnings"    = $ThermalWarnings
+    DpcPercent = if ($null -ne $DpcPercent) {
+        [math]::Round($DpcPercent, 2)
+    }
+    else {
+        $null
+    }
+
+    ContextSwitchesPerSec = if ($null -ne $ContextSwitches) {
+        [math]::Round($ContextSwitches, 2)
+    }
+    else {
+        $null
+    }
+
+    AvgDiskLatencyMs = if ($null -ne $AvgDiskLatencyMs) {
+        [math]::Round($AvgDiskLatencyMs, 2)
+    }
+    else {
+        $null
+    }
+
+    PingLatencyMs = if ($null -ne $PingLatencyMs) {
+        [math]::Round($PingLatencyMs, 2)
+    }
+    else {
+        $null
+    }
+
+    # Preserve the legacy Celsius field for backward compatibility.
+    CpuTempC = if ($null -ne $CpuTempC) {
+        [math]::Round($CpuTempC, 2)
+    }
+    else {
+        $null
+    }
+
+    CpuTemperature = $CpuTemperature
+
+    GpuTempFound = $GpuTempFound
+
+    GpuTempC = if ($null -ne $GpuTempC) {
+        [math]::Round($GpuTempC, 2)
+    }
+    else {
+        $null
+    }
+
+    GpuTemperature = $GpuTemperature
+
+    DiskTemperatures = $DiskTemperatures
+
+    HighLatencyDrivers = $HighLatencyDrivers
+
+    RealtimeSamples = $RealtimeSamples
+
+    Issues = $Issues
+
+    Warnings = $Warnings
 }
 
-# Convert the diagnostic result to compact JSON.
-$JsonOutput = $DiagnosticResult | ConvertTo-Json -Depth 3 -Compress
+$JsonOutput = $DiagnosticReport | ConvertTo-Json -Depth 6
 
-Write-Output "---JSON_START---"
-Write-Output $JsonOutput
-Write-Output "---JSON_END---"
+Write-Host ""
+Write-Host "======================================================================"
+Write-Host "JSON Diagnostic Report"
+Write-Host "======================================================================"
+
+Write-Host $JsonOutput
+
+# ======================================================================
+# End of Diagnostic Tool
+# ======================================================================
