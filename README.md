@@ -1,4 +1,4 @@
-# VRM21 Windows Diagnostic Engine
+# Windows Diagnostic Engine
 
 A modular Windows system diagnostic and audit framework built with Python and PowerShell.
 
